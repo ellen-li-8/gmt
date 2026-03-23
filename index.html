@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SCOTUS Cert Tracker</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f0f13;
+      --surface: #16161d;
+      --surface2: #1e1e27;
+      --border: #2a2a38;
+      --border2: #3a3a50;
+      --text: #e8e8f0;
+      --muted: #8888a8;
+      --accent: #c8a96e;
+      --accent2: #e8c98e;
+      --granted: #3a6e4a;
+      --granted-text: #7ec894;
+      --denied: #6e3a3a;
+      --denied-text: #e87c7c;
+      --tag-bg: #232333;
+      --tag-border: #3a3a55;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Georgia', serif;
+      min-height: 100vh;
+    }
+
+    header {
+      border-bottom: 1px solid var(--border);
+      padding: 2rem 2.5rem 1.5rem;
+      display: flex;
+      align-items: flex-end;
+      gap: 1.5rem;
+    }
+
+    .seal {
+      font-size: 2.5rem;
+      line-height: 1;
+    }
+
+    .header-text h1 {
+      font-size: 1.5rem;
+      font-weight: normal;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--accent2);
+    }
+
+    .header-text p {
+      font-size: 0.8rem;
+      color: var(--muted);
+      letter-spacing: 0.06em;
+      font-family: 'Courier New', monospace;
+      margin-top: 2px;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 360px 1fr;
+      min-height: calc(100vh - 90px);
+    }
+
+    .sidebar {
+      border-right: 1px solid var(--border);
+      padding: 1.5rem;
+      background: var(--surface);
+    }
+
+    .sidebar h2 {
+      font-size: 0.7rem;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 1.2rem;
+      font-family: 'Courier New', monospace;
+    }
+
+    .form-group {
+      margin-bottom: 1rem;
+    }
+
+    label {
+      display: block;
+      font-size: 0.72rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 0.35rem;
+      font-family: 'Courier New', monospace;
+    }
+
+    input[type="text"], input[type="date"], select {
+      width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 0.55rem 0.75rem;
+      font-size: 0.88rem;
+      font-family: 'Georgia', serif;
+      border-radius: 4px;
+      transition: border-color 0.15s;
+      outline: none;
+    }
+
+    input:focus, select:focus {
+      border-color: var(--accent);
+    }
+
+    select option { background: var(--surface2); }
+
+    .cert-toggle {
+      display: flex;
+      gap: 0;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+
+    .cert-toggle button {
+      flex: 1;
+      padding: 0.55rem;
+      background: var(--surface2);
+      border: none;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 0.82rem;
+      letter-spacing: 0.05em;
+      font-family: 'Courier New', monospace;
+      transition: all 0.15s;
+    }
+
+    .cert-toggle button.active-granted {
+      background: var(--granted);
+      color: var(--granted-text);
+    }
+
+    .cert-toggle button.active-denied {
+      background: var(--denied);
+      color: var(--denied-text);
+    }
+
+    .buckets-section {
+      margin-top: 1.2rem;
+    }
+
+    .buckets-section h3 {
+      font-size: 0.68rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 0.75rem;
+      font-family: 'Courier New', monospace;
+    }
+
+    .bucket-item {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      padding: 0.45rem 0;
+      border-bottom: 1px solid var(--border);
+      cursor: pointer;
+    }
+
+    .bucket-item:last-child { border-bottom: none; }
+
+    .bucket-check {
+      width: 16px;
+      height: 16px;
+      border: 1px solid var(--border2);
+      border-radius: 3px;
+      background: var(--surface2);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      transition: all 0.15s;
+    }
+
+    .bucket-check.checked {
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+
+    .bucket-check.checked::after {
+      content: '✓';
+      font-size: 10px;
+      color: #1a1200;
+      font-weight: bold;
+    }
+
+    .bucket-label {
+      font-size: 0.82rem;
+      color: var(--text);
+      user-select: none;
+    }
+
+    .submit-btn {
+      width: 100%;
+      margin-top: 1.5rem;
+      padding: 0.75rem;
+      background: var(--accent);
+      color: #1a1200;
+      border: none;
+      font-size: 0.8rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      font-family: 'Courier New', monospace;
+      font-weight: bold;
+      cursor: pointer;
+      border-radius: 4px;
+      transition: background 0.15s;
+    }
+
+    .submit-btn:hover { background: var(--accent2); }
+
+    .main {
+      padding: 1.5rem 2rem;
+      overflow-x: auto;
+    }
+
+    .main-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 1.25rem;
+    }
+
+    .main-header h2 {
+      font-size: 0.7rem;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--muted);
+      font-family: 'Courier New', monospace;
+    }
+
+    .stats {
+      display: flex;
+      gap: 1.5rem;
+      align-items: center;
+    }
+
+    .stat {
+      text-align: center;
+    }
+
+    .stat-num {
+      font-size: 1.4rem;
+      color: var(--accent2);
+      line-height: 1;
+    }
+
+    .stat-label {
+      font-size: 0.65rem;
+      color: var(--muted);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-family: 'Courier New', monospace;
+    }
+
+    .export-btn {
+      padding: 0.45rem 1rem;
+      background: transparent;
+      border: 1px solid var(--accent);
+      color: var(--accent);
+      font-size: 0.72rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-family: 'Courier New', monospace;
+      cursor: pointer;
+      border-radius: 4px;
+      transition: all 0.15s;
+    }
+
+    .export-btn:hover {
+      background: var(--accent);
+      color: #1a1200;
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 4rem 2rem;
+      color: var(--muted);
+      font-size: 0.85rem;
+      font-family: 'Courier New', monospace;
+      letter-spacing: 0.05em;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.82rem;
+      min-width: 900px;
+    }
+
+    thead tr {
+      border-bottom: 1px solid var(--border2);
+    }
+
+    th {
+      text-align: left;
+      padding: 0.6rem 0.75rem;
+      font-size: 0.65rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--muted);
+      font-family: 'Courier New', monospace;
+      font-weight: normal;
+    }
+
+    tbody tr {
+      border-bottom: 1px solid var(--border);
+      transition: background 0.1s;
+    }
+
+    tbody tr:hover { background: var(--surface); }
+
+    td {
+      padding: 0.6rem 0.75rem;
+      vertical-align: middle;
+    }
+
+    .case-name { color: var(--accent2); font-style: italic; }
+
+    .cert-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 3px;
+      font-size: 0.7rem;
+      font-family: 'Courier New', monospace;
+      letter-spacing: 0.05em;
+    }
+
+    .cert-1 { background: var(--granted); color: var(--granted-text); }
+    .cert-0 { background: var(--denied); color: var(--denied-text); }
+
+    .tag {
+      display: inline-block;
+      background: var(--tag-bg);
+      border: 1px solid var(--tag-border);
+      color: var(--muted);
+      font-size: 0.62rem;
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-family: 'Courier New', monospace;
+      margin: 1px;
+      letter-spacing: 0.03em;
+    }
+
+    .delete-btn {
+      background: none;
+      border: none;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 0.9rem;
+      padding: 2px 6px;
+      border-radius: 3px;
+      transition: all 0.1s;
+    }
+
+    .delete-btn:hover { color: var(--denied-text); background: var(--denied); }
+
+    .divider {
+      width: 1px;
+      height: 30px;
+      background: var(--border);
+    }
+
+    .error {
+      color: var(--denied-text);
+      font-size: 0.75rem;
+      font-family: 'Courier New', monospace;
+      margin-top: 0.5rem;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="seal">⚖</div>
+  <div class="header-text">
+    <h1>SCOTUS Cert Tracker</h1>
+    <p>Supreme Court of the United States — Certiorari Dataset</p>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h2>Add Case</h2>
+
+    <div class="form-group">
+      <label>Case Name</label>
+      <input type="text" id="caseName" placeholder="e.g. Dobbs v. Jackson Women's Health" />
+      <div class="error" id="nameError">Case name is required.</div>
+    </div>
+
+    <div class="form-group">
+      <label>Date of Order</label>
+      <input type="date" id="caseDate" />
+    </div>
+
+    <div class="form-group">
+      <label>Term (e.g. October 2021)</label>
+      <input type="text" id="caseTerm" placeholder="e.g. October 2021" />
+    </div>
+
+    <div class="form-group">
+      <label>Certiorari</label>
+      <div class="cert-toggle">
+        <button id="btn-granted" onclick="setCert(1)">Granted (1)</button>
+        <button id="btn-denied" onclick="setCert(0)">Denied (0)</button>
+      </div>
+    </div>
+
+    <div class="buckets-section">
+      <h3>Cert Buckets</h3>
+      <div id="bucket-circuit" class="bucket-item" onclick="toggleBucket('circuit')">
+        <div class="bucket-check" id="check-circuit"></div>
+        <span class="bucket-label">Circuit Split</span>
+      </div>
+      <div id="bucket-federalism" class="bucket-item" onclick="toggleBucket('federalism')">
+        <div class="bucket-check" id="check-federalism"></div>
+        <span class="bucket-label">Federalism Conflict (State vs. Federal)</span>
+      </div>
+      <div id="bucket-precedent" class="bucket-item" onclick="toggleBucket('precedent')">
+        <div class="bucket-check" id="check-precedent"></div>
+        <span class="bucket-label">Precedent Matter</span>
+      </div>
+      <div id="bucket-national" class="bucket-item" onclick="toggleBucket('national')">
+        <div class="bucket-check" id="check-national"></div>
+        <span class="bucket-label">National Significance</span>
+      </div>
+    </div>
+
+    <button class="submit-btn" onclick="addCase()">+ Add Case</button>
+  </aside>
+
+  <main class="main">
+    <div class="main-header">
+      <div class="stats">
+        <div class="stat">
+          <div class="stat-num" id="stat-total">0</div>
+          <div class="stat-label">Total</div>
+        </div>
+        <div class="divider"></div>
+        <div class="stat">
+          <div class="stat-num" id="stat-granted">0</div>
+          <div class="stat-label">Granted</div>
+        </div>
+        <div class="divider"></div>
+        <div class="stat">
+          <div class="stat-num" id="stat-pct">—</div>
+          <div class="stat-label">Grant Rate</div>
+        </div>
+      </div>
+      <div style="display:flex;gap:0.75rem;align-items:center;">
+        <h2 id="case-count-label">0 cases</h2>
+        <button class="export-btn" onclick="exportXLSX()">Export .xlsx</button>
+      </div>
+    </div>
+
+    <div id="empty-state" class="empty-state">
+      No cases added yet. Use the form to start building your dataset.
+    </div>
+
+    <div id="table-wrapper" style="display:none;">
+      <table>
+        <thead>
+          <tr>
+            <th>Case Name</th>
+            <th>Date</th>
+            <th>Term</th>
+            <th>Cert</th>
+            <th>Circuit Split</th>
+            <th>Federalism</th>
+            <th>Precedent</th>
+            <th>Nat'l Sig.</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="case-tbody"></tbody>
+      </table>
+    </div>
+  </main>
+</div>
+
+<script>
+  let cases = JSON.parse(localStorage.getItem('scotus-cases') || '[]');
+  let certValue = null;
+  let buckets = { circuit: false, federalism: false, precedent: false, national: false };
+
+  function setCert(val) {
+    certValue = val;
+    document.getElementById('btn-granted').className = val === 1 ? 'active-granted' : '';
+    document.getElementById('btn-denied').className = val === 0 ? 'active-denied' : '';
+  }
+
+  function toggleBucket(key) {
+    buckets[key] = !buckets[key];
+    const el = document.getElementById('check-' + key);
+    el.className = 'bucket-check' + (buckets[key] ? ' checked' : '');
+  }
+
+  function resetForm() {
+    document.getElementById('caseName').value = '';
+    document.getElementById('caseDate').value = '';
+    document.getElementById('caseTerm').value = '';
+    certValue = null;
+    document.getElementById('btn-granted').className = '';
+    document.getElementById('btn-denied').className = '';
+    buckets = { circuit: false, federalism: false, precedent: false, national: false };
+    ['circuit','federalism','precedent','national'].forEach(k => {
+      document.getElementById('check-' + k).className = 'bucket-check';
+    });
+  }
+
+  function addCase() {
+    const name = document.getElementById('caseName').value.trim();
+    const errEl = document.getElementById('nameError');
+    if (!name) { errEl.style.display = 'block'; return; }
+    errEl.style.display = 'none';
+
+    const c = {
+      id: Date.now(),
+      name,
+      date: document.getElementById('caseDate').value || '',
+      term: document.getElementById('caseTerm').value.trim() || '',
+      cert: certValue !== null ? certValue : '',
+      circuit: buckets.circuit ? 1 : 0,
+      federalism: buckets.federalism ? 1 : 0,
+      precedent: buckets.precedent ? 1 : 0,
+      national: buckets.national ? 1 : 0,
+    };
+
+    cases.unshift(c);
+    save();
+    render();
+    resetForm();
+  }
+
+  function deleteCase(id) {
+    cases = cases.filter(c => c.id !== id);
+    save();
+    render();
+  }
+
+  function save() {
+    localStorage.setItem('scotus-cases', JSON.stringify(cases));
+  }
+
+  function render() {
+    const tbody = document.getElementById('case-tbody');
+    const total = cases.length;
+    const granted = cases.filter(c => c.cert === 1).length;
+    const pct = total > 0 ? Math.round((granted / total) * 100) + '%' : '—';
+
+    document.getElementById('stat-total').textContent = total;
+    document.getElementById('stat-granted').textContent = granted;
+    document.getElementById('stat-pct').textContent = pct;
+    document.getElementById('case-count-label').textContent = total + ' case' + (total !== 1 ? 's' : '');
+
+    if (total === 0) {
+      document.getElementById('empty-state').style.display = 'block';
+      document.getElementById('table-wrapper').style.display = 'none';
+      return;
+    }
+
+    document.getElementById('empty-state').style.display = 'none';
+    document.getElementById('table-wrapper').style.display = 'block';
+
+    tbody.innerHTML = cases.map(c => {
+      const certHtml = c.cert === 1
+        ? '<span class="cert-badge cert-1">Granted</span>'
+        : c.cert === 0
+        ? '<span class="cert-badge cert-0">Denied</span>'
+        : '<span style="color:var(--muted);font-size:0.75rem;">—</span>';
+
+      const bit = v => v === 1
+        ? '<span style="color:var(--granted-text);font-family:monospace;">1</span>'
+        : '<span style="color:var(--muted);font-family:monospace;">0</span>';
+
+      return `<tr>
+        <td class="case-name">${escHtml(c.name)}</td>
+        <td style="color:var(--muted);font-family:monospace;font-size:0.78rem;">${c.date || '—'}</td>
+        <td style="font-size:0.8rem;">${escHtml(c.term) || '—'}</td>
+        <td>${certHtml}</td>
+        <td style="text-align:center;">${bit(c.circuit)}</td>
+        <td style="text-align:center;">${bit(c.federalism)}</td>
+        <td style="text-align:center;">${bit(c.precedent)}</td>
+        <td style="text-align:center;">${bit(c.national)}</td>
+        <td><button class="delete-btn" onclick="deleteCase(${c.id})">✕</button></td>
+      </tr>`;
+    }).join('');
+  }
+
+  function escHtml(str) {
+    return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function exportXLSX() {
+    if (cases.length === 0) { alert('No cases to export.'); return; }
+    const rows = cases.map(c => ({
+      'Case Name': c.name,
+      'Date': c.date,
+      'Term': c.term,
+      'Granted Cert (0/1)': c.cert === '' ? '' : c.cert,
+      'Circuit Split': c.circuit,
+      'Federalism Conflict (State vs. Federal)': c.federalism,
+      'Precedent Matter': c.precedent,
+      'National Significance': c.national,
+    }));
+    const ws = XLSX.utils.json_to_sheet(rows);
+    ws['!cols'] = [{ wch: 45 }, { wch: 14 }, { wch: 18 }, { wch: 18 }, { wch: 16 }, { wch: 36 }, { wch: 18 }, { wch: 22 }];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'SCOTUS Cases');
+    XLSX.writeFile(wb, 'scotus_cert_tracker.xlsx');
+  }
+
+  render();
+</script>
+</body>
+</html>
