@@ -123,6 +123,7 @@ td{padding:.6rem .85rem;vertical-align:top}
 
 <script>
 let currentJobId = null;
+let pollInterval = null;
 
 function startScrape() {
   const btn = document.getElementById('runBtn');
@@ -136,65 +137,72 @@ function startScrape() {
   document.getElementById('emptyMsg').style.display = 'block';
   document.getElementById('tbody').innerHTML = '';
   document.getElementById('statusMsg').style.color = 'var(--muted)';
+
+  if (pollInterval) clearInterval(pollInterval);
   currentJobId = null;
 
-  const es = new EventSource('/api/scrape');
+  // Kick off the job
+  fetch('/api/start', { method: 'POST' })
+    .then(r => r.json())
+    .then(data => {
+      currentJobId = data.job_id;
+      // Poll every 3 seconds
+      pollInterval = setInterval(pollStatus, 3000);
+    })
+    .catch(err => {
+      setError('Failed to start scrape: ' + err);
+      btn.disabled = false;
+      btn.textContent = '↺ Retry';
+    });
+}
 
-  es.onmessage = function(e) {
-    let data;
-    try { data = JSON.parse(e.data); } catch { return; }
-
-    if (data.type === 'progress') {
-      document.getElementById('statusMsg').textContent = data.msg;
+function pollStatus() {
+  if (!currentJobId) return;
+  fetch('/api/status/' + currentJobId)
+    .then(r => r.json())
+    .then(data => {
+      document.getElementById('statusMsg').textContent = data.msg || '...';
       document.getElementById('progressFill').style.width = (data.pct || 0) + '%';
 
-    } else if (data.type === 'done') {
-      es.close();
-      currentJobId = data.job_id;
-      document.getElementById('progressFill').style.width = '100%';
-      document.getElementById('statusMsg').textContent =
-        `Done. ${data.total.toLocaleString()} cases — ${data.granted} granted, ${data.denied} denied.`;
+      if (data.status === 'done') {
+        clearInterval(pollInterval);
+        pollInterval = null;
+        onDone(data);
+      } else if (data.status === 'error') {
+        clearInterval(pollInterval);
+        pollInterval = null;
+        setError(data.msg || 'Unknown error.');
+        document.getElementById('runBtn').disabled = false;
+        document.getElementById('runBtn').textContent = '↺ Retry';
+      }
+    })
+    .catch(() => {
+      // Network blip — keep polling, don't panic
+    });
+}
 
-      renderTable(data.preview, data.total, data.granted, data.denied);
-      btn.disabled = false;
-      btn.textContent = '↺ Re-scrape';
-      document.getElementById('dlBtn').style.display = 'inline-block';
-      document.getElementById('done-msg').style.display = 'inline';
-      document.getElementById('done-msg').textContent =
-        `✓ ${data.total.toLocaleString()} cases ready`;
+function onDone(data) {
+  renderTable(data.preview || [], data.total, data.granted, data.denied);
+  document.getElementById('runBtn').disabled = false;
+  document.getElementById('runBtn').textContent = '↺ Re-scrape';
+  document.getElementById('dlBtn').style.display = 'inline-block';
+  document.getElementById('done-msg').style.display = 'inline';
+  document.getElementById('done-msg').textContent =
+    `✓ ${(data.total || 0).toLocaleString()} cases ready`;
+}
 
-    } else if (data.type === 'error') {
-      es.close();
-      document.getElementById('statusMsg').style.color = 'var(--red-t)';
-      document.getElementById('statusMsg').textContent = 'Error: ' + (data.msg || 'Unknown error. Check server logs.');
-      btn.disabled = false;
-      btn.textContent = '↺ Retry';
-    }
-  };
-
-  es.onerror = function() {
-    // Only treat as error if we haven't already completed
-    if (!currentJobId) {
-      es.close();
-      document.getElementById('statusMsg').style.color = 'var(--red-t)';
-      document.getElementById('statusMsg').textContent =
-        'Connection lost. The scrape may still be running — wait 30s then check if the download button appeared, or retry.';
-      btn.disabled = false;
-      btn.textContent = '↺ Retry';
-    }
-  };
+function setError(msg) {
+  document.getElementById('statusMsg').style.color = 'var(--red-t)';
+  document.getElementById('statusMsg').textContent = 'Error: ' + msg;
 }
 
 function renderTable(cases, total, granted, denied) {
   const tbody = document.getElementById('tbody');
   tbody.innerHTML = '';
 
-  const terms = new Set(cases.map(c => c.term).filter(Boolean));
-  const oyezMatches = cases.filter(c => c.oyez_url).length;
-
-  document.getElementById('s-total').textContent = total.toLocaleString();
-  document.getElementById('s-granted').textContent = granted;
-  document.getElementById('s-denied').textContent = denied;
+  document.getElementById('s-total').textContent = (total || 0).toLocaleString();
+  document.getElementById('s-granted').textContent = granted || 0;
+  document.getElementById('s-denied').textContent = denied || 0;
   document.getElementById('s-showing').textContent = cases.length;
   document.getElementById('statsRow').style.display = 'flex';
 
@@ -202,7 +210,6 @@ function renderTable(cases, total, granted, denied) {
     document.getElementById('emptyMsg').style.display = 'block';
     return;
   }
-
   document.getElementById('emptyMsg').style.display = 'none';
   document.getElementById('caseTable').style.display = 'table';
 
