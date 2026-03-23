@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>SCOTUS Cert Scraper</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0f0f13;--surface:#16161d;--surface2:#1e1e27;
+  --border:#2a2a38;--border2:#3a3a50;
+  --text:#e8e8f0;--muted:#8888a8;
+  --accent:#c8a96e;--accent2:#e8c98e;
+  --green:#3a6e4a;--green-t:#7ec894;
+  --red:#6e3a3a;--red-t:#e87c7c;
+}
+body{background:var(--bg);color:var(--text);font-family:'Georgia',serif;min-height:100vh}
+header{border-bottom:1px solid var(--border);padding:1.75rem 2rem 1.5rem;display:flex;align-items:flex-end;gap:1.2rem}
+.seal{font-size:2.2rem;line-height:1}
+.header-text h1{font-size:1.35rem;font-weight:normal;letter-spacing:.08em;text-transform:uppercase;color:var(--accent2)}
+.header-text p{font-size:.75rem;color:var(--muted);letter-spacing:.06em;font-family:'Courier New',monospace;margin-top:2px}
+.container{max-width:1400px;margin:0 auto;padding:2rem}
+.controls{display:flex;align-items:center;gap:1rem;margin-bottom:2rem;flex-wrap:wrap}
+.run-btn{
+  padding:.7rem 2rem;background:var(--accent);color:#1a1200;
+  border:none;font-size:.82rem;letter-spacing:.1em;text-transform:uppercase;
+  font-family:'Courier New',monospace;font-weight:bold;cursor:pointer;
+  border-radius:4px;transition:background .15s;
+}
+.run-btn:hover{background:var(--accent2)}
+.run-btn:disabled{background:#555;color:#999;cursor:not-allowed}
+.dl-btn{
+  padding:.7rem 2rem;background:transparent;
+  border:1px solid var(--accent);color:var(--accent);
+  font-size:.82rem;letter-spacing:.1em;text-transform:uppercase;
+  font-family:'Courier New',monospace;cursor:pointer;border-radius:4px;
+  transition:all .15s;display:none;
+}
+.dl-btn:hover{background:var(--accent);color:#1a1200}
+.status-box{
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:6px;padding:1rem 1.25rem;margin-bottom:1.5rem;
+  display:none;
+}
+.status-line{font-size:.82rem;color:var(--muted);font-family:'Courier New',monospace;margin-bottom:.5rem}
+.progress-bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}
+.progress-fill{height:100%;background:var(--accent);border-radius:3px;transition:width .3s ease}
+.stats{display:flex;gap:2rem;margin-bottom:1.5rem;flex-wrap:wrap}
+.stat{text-align:center;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:.75rem 1.25rem;min-width:100px}
+.stat-num{font-size:1.6rem;color:var(--accent2);line-height:1}
+.stat-label{font-size:.65rem;color:var(--muted);letter-spacing:.08em;text-transform:uppercase;font-family:'Courier New',monospace;margin-top:2px}
+.table-wrap{overflow-x:auto;border:1px solid var(--border);border-radius:6px}
+table{width:100%;border-collapse:collapse;font-size:.8rem;min-width:900px}
+thead tr{border-bottom:1px solid var(--border2)}
+th{text-align:left;padding:.65rem .85rem;font-size:.65rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);font-family:'Courier New',monospace;font-weight:normal;background:var(--surface)}
+tbody tr{border-bottom:1px solid var(--border);transition:background .1s}
+tbody tr:hover{background:var(--surface)}
+td{padding:.6rem .85rem;vertical-align:top}
+.case-name{color:var(--accent2);font-style:italic;max-width:300px}
+.badge{display:inline-block;padding:2px 8px;border-radius:3px;font-size:.7rem;font-family:'Courier New',monospace}
+.badge-1{background:var(--green);color:var(--green-t)}
+.badge-0{background:var(--red);color:var(--red-t)}
+.mono{font-family:'Courier New',monospace;font-size:.75rem;color:var(--muted)}
+.empty{text-align:center;padding:4rem 2rem;color:var(--muted);font-family:'Courier New',monospace;font-size:.85rem}
+.note{font-size:.75rem;color:var(--muted);font-family:'Courier New',monospace;line-height:1.6;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:.85rem 1rem;margin-bottom:1.5rem}
+.note strong{color:var(--accent)}
+</style>
+</head>
+<body>
+<header>
+  <div class="seal">⚖</div>
+  <div class="header-text">
+    <h1>SCOTUS Cert Scraper</h1>
+    <p>Scrapes supremecourt.gov + Oyez · 2011–present · Exports to Excel</p>
+  </div>
+</header>
+
+<div class="container">
+  <div class="note">
+    <strong>What this does:</strong> Fetches every Order List PDF from supremecourt.gov for terms 2011–2025,
+    extracts all cases where certiorari was <em>granted</em>, then enriches each case with outcome and issue area
+    data from the Oyez API. The bucket columns (Circuit Split, Federalism, etc.) are left for manual categorization
+    — export to Excel and fill those in. Scraping all ~14 terms takes 3–7 minutes.
+  </div>
+
+  <div class="controls">
+    <button class="run-btn" id="runBtn" onclick="startScrape()">▶ Start Scrape</button>
+    <button class="dl-btn" id="dlBtn" onclick="downloadExcel()">↓ Download Excel</button>
+    <span id="done-msg" style="font-family:'Courier New',monospace;font-size:.8rem;color:var(--green-t);display:none"></span>
+  </div>
+
+  <div class="status-box" id="statusBox">
+    <div class="status-line" id="statusMsg">Initializing...</div>
+    <div class="progress-bar"><div class="progress-fill" id="progressFill" style="width:0%"></div></div>
+  </div>
+
+  <div class="stats" id="statsRow" style="display:none">
+    <div class="stat"><div class="stat-num" id="s-total">0</div><div class="stat-label">Granted Cases</div></div>
+    <div class="stat"><div class="stat-num" id="s-terms">0</div><div class="stat-label">Terms</div></div>
+    <div class="stat"><div class="stat-num" id="s-oyez">0</div><div class="stat-label">Oyez Matches</div></div>
+    <div class="stat"><div class="stat-num" id="s-showing">0</div><div class="stat-label">Showing (preview)</div></div>
+  </div>
+
+  <div class="table-wrap">
+    <div class="empty" id="emptyMsg">Click "Start Scrape" to begin collecting SCOTUS cert data.</div>
+    <table id="caseTable" style="display:none">
+      <thead>
+        <tr>
+          <th>Case Name</th>
+          <th>Docket</th>
+          <th>Date</th>
+          <th>Term</th>
+          <th>Cert</th>
+          <th>Outcome</th>
+          <th>Direction</th>
+          <th>Issue Area</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+let excelB64 = null;
+let allCases = [];
+
+function startScrape() {
+  const btn = document.getElementById('runBtn');
+  btn.disabled = true;
+  btn.textContent = '⟳ Scraping...';
+  document.getElementById('statusBox').style.display = 'block';
+  document.getElementById('dlBtn').style.display = 'none';
+  document.getElementById('done-msg').style.display = 'none';
+  document.getElementById('statsRow').style.display = 'none';
+  document.getElementById('caseTable').style.display = 'none';
+  document.getElementById('emptyMsg').style.display = 'block';
+  document.getElementById('tbody').innerHTML = '';
+
+  const es = new EventSource('/api/scrape');
+  es.onmessage = function(e) {
+    const data = JSON.parse(e.data);
+    if (data.type === 'progress') {
+      document.getElementById('statusMsg').textContent = data.msg;
+      document.getElementById('progressFill').style.width = data.pct + '%';
+    } else if (data.type === 'done') {
+      es.close();
+      document.getElementById('progressFill').style.width = '100%';
+      document.getElementById('statusMsg').textContent = `Done. ${data.total} cases collected.`;
+
+      allCases = data.preview;
+      excelB64 = data.excel_b64;
+
+      renderTable(data.preview, data.total);
+      btn.disabled = false;
+      btn.textContent = '↺ Re-scrape';
+      document.getElementById('dlBtn').style.display = 'inline-block';
+      document.getElementById('done-msg').style.display = 'inline';
+      document.getElementById('done-msg').textContent = `✓ ${data.total} cases ready`;
+    }
+  };
+  es.onerror = function() {
+    es.close();
+    document.getElementById('statusMsg').textContent = 'Error during scrape. Check server logs.';
+    btn.disabled = false;
+    btn.textContent = '↺ Retry';
+  };
+}
+
+function renderTable(cases, total) {
+  const tbody = document.getElementById('tbody');
+  tbody.innerHTML = '';
+
+  const terms = new Set(cases.map(c => c.term).filter(Boolean));
+  const oyezMatches = cases.filter(c => c.oyez_url).length;
+
+  document.getElementById('s-total').textContent = total;
+  document.getElementById('s-terms').textContent = terms.size;
+  document.getElementById('s-oyez').textContent = oyezMatches;
+  document.getElementById('s-showing').textContent = cases.length;
+  document.getElementById('statsRow').style.display = 'flex';
+
+  if (!cases.length) {
+    document.getElementById('emptyMsg').style.display = 'block';
+    return;
+  }
+
+  document.getElementById('emptyMsg').style.display = 'none';
+  document.getElementById('caseTable').style.display = 'table';
+
+  cases.forEach(c => {
+    const tr = document.createElement('tr');
+    const oyezLink = c.oyez_url
+      ? `<a href="${esc(c.oyez_url)}" target="_blank" style="color:var(--accent);font-size:.72rem;">[Oyez]</a>`
+      : '';
+    tr.innerHTML = `
+      <td class="case-name">${esc(c.case_name)} ${oyezLink}</td>
+      <td class="mono">${esc(c.docket)}</td>
+      <td class="mono">${esc(c.date)}</td>
+      <td style="font-size:.78rem;">${esc(c.term)}</td>
+      <td><span class="badge badge-${c.granted_cert}">Granted</span></td>
+      <td style="font-size:.78rem;max-width:180px;">${esc(c.outcome)}</td>
+      <td style="font-size:.78rem;">${esc(c.decision_direction)}</td>
+      <td style="font-size:.78rem;max-width:180px;">${esc(c.issue_area)}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+function esc(s) {
+  if (!s && s !== 0) return '';
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function downloadExcel() {
+  if (!excelB64) return;
+  const bytes = atob(excelB64);
+  const arr = new Uint8Array(bytes.length);
+  for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+  const blob = new Blob([arr], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'scotus_cert_cases.xlsx';
+  a.click();
+}
+</script>
+</body>
+</html>
