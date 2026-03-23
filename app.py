@@ -453,6 +453,14 @@ def build_excel(cases: list[dict]) -> bytes:
     return buf.read()
 
 
+# ─── In-memory result store ───────────────────────────────────────────────────
+# Keyed by a job_id so concurrent users don't clobber each other.
+import uuid
+_results: dict[str, bytes] = {}   # job_id -> excel bytes
+_previews: dict[str, list] = {}   # job_id -> first 200 cases (for UI table)
+_totals: dict[str, dict] = {}     # job_id -> {total, granted, denied}
+
+
 # ─── Flask routes ──────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -462,73 +470,96 @@ def index():
 
 @app.route("/api/scrape")
 def scrape():
-    """SSE endpoint: streams progress + final result as JSON."""
+    """SSE endpoint: streams progress messages, stores result server-side."""
+    import json
+
+    job_id = str(uuid.uuid4())
+
     def generate():
         all_cases = []
         total_terms = len(TERM_YEARS)
 
-        for idx, term_year in enumerate(TERM_YEARS):
-            full_year = 2000 + term_year
-            yield f"data: {{'type':'progress','msg':'Fetching order lists for {full_year} term ({idx+1}/{total_terms})...','pct':{int((idx/total_terms)*50)}}}\n\n"
+        try:
+            for idx, term_year in enumerate(TERM_YEARS):
+                full_year = 2000 + term_year
+                pct = int((idx / total_terms) * 50)
+                yield _sse("progress", f"Fetching order lists for {full_year} term ({idx+1}/{total_terms})...", pct)
 
-            order_urls = get_order_list_urls(term_year)
-            if not order_urls:
-                yield f"data: {{'type':'progress','msg':'No order lists found for {full_year}, skipping.','pct':{int((idx/total_terms)*50)}}}\n\n"
-                continue
+                order_urls = get_order_list_urls(term_year)
+                if not order_urls:
+                    yield _sse("progress", f"No order lists found for {full_year}, skipping.", pct)
+                    continue
 
-            yield f"data: {{'type':'progress','msg':'Found {len(order_urls)} order lists for {full_year}. Parsing PDFs...','pct':{int((idx/total_terms)*50)}}}\n\n"
+                yield _sse("progress", f"Found {len(order_urls)} order lists for {full_year}. Parsing PDFs...", pct)
 
-            term_cases = []
-            for pdf_info in order_urls:
-                parsed = parse_order_list_pdf(pdf_info["url"], pdf_info["date"], term_year)
-                term_cases.extend(parsed)
+                term_cases = []
+                for pdf_info in order_urls:
+                    parsed = parse_order_list_pdf(pdf_info["url"], pdf_info["date"], term_year)
+                    term_cases.extend(parsed)
+                    time.sleep(0.05)
+
+                # Deduplicate within term by (docket, granted_cert) key
+                seen: set[str] = set()
+                unique = []
+                for c in term_cases:
+                    key = f"{c['docket']}_{c['granted_cert']}"
+                    if key not in seen:
+                        seen.add(key)
+                        unique.append(c)
+
+                all_cases.extend(unique)
+                g = sum(1 for c in unique if c["granted_cert"] == 1)
+                d = sum(1 for c in unique if c["granted_cert"] == 0)
+                yield _sse("progress", f"{full_year}: {len(unique)} cases ({g} granted, {d} denied).", pct)
                 time.sleep(0.1)
 
-            # Deduplicate within term by docket number
-            seen = set()
-            unique = []
-            for c in term_cases:
-                key = c["docket"]
-                if key not in seen:
-                    seen.add(key)
-                    unique.append(c)
+            yield _sse("progress", f"Enriching {len(all_cases)} cases with Oyez data...", 52)
+            all_cases = enrich_with_oyez(all_cases)
 
-            all_cases.extend(unique)
-            g = sum(1 for c in unique if c["granted_cert"] == 1)
-            d = sum(1 for c in unique if c["granted_cert"] == 0)
-            yield f"data: {{'type':'progress','msg':'{full_year}: {len(unique)} cases ({g} granted, {d} denied).','pct':{int((idx/total_terms)*50)}}}\n\n"
-            time.sleep(0.2)
+            yield _sse("progress", "Building Excel file...", 92)
+            excel_bytes = build_excel(all_cases)
 
-        yield f"data: {{'type':'progress','msg':'Enriching {len(all_cases)} cases with Oyez data...','pct':55}}\n\n"
-        all_cases = enrich_with_oyez(all_cases)
+            # Store server-side — only send lightweight summary to client
+            _results[job_id] = excel_bytes
+            _previews[job_id] = all_cases[:300]
+            granted_total = sum(1 for c in all_cases if c["granted_cert"] == 1)
+            denied_total  = sum(1 for c in all_cases if c["granted_cert"] == 0)
+            _totals[job_id] = {
+                "total": len(all_cases),
+                "granted": granted_total,
+                "denied": denied_total,
+            }
 
-        yield f"data: {{'type':'progress','msg':'Building Excel file...','pct':90}}\n\n"
+            payload = json.dumps({
+                "type": "done",
+                "job_id": job_id,
+                "total": len(all_cases),
+                "granted": granted_total,
+                "denied": denied_total,
+                "preview": _previews[job_id],
+            })
+            yield f"data: {payload}\n\n"
 
-        import json, base64
-        excel_bytes = build_excel(all_cases)
-        b64 = base64.b64encode(excel_bytes).decode()
-
-        # Emit the cases as JSON for preview
-        preview = all_cases[:200]  # first 200 for UI display
-        payload = json.dumps({
-            "type": "done",
-            "total": len(all_cases),
-            "preview": preview,
-            "excel_b64": b64,
-        })
-        yield f"data: {payload}\n\n"
+        except Exception as e:
+            log.exception("Scrape failed")
+            payload = json.dumps({"type": "error", "msg": str(e)})
+            yield f"data: {payload}\n\n"
 
     return Response(generate(), mimetype="text/event-stream",
                     headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
 
 
-@app.route("/api/download", methods=["POST"])
-def download():
-    from flask import request as freq
-    import json, base64
-    data = freq.get_json()
-    cases = data.get("cases", [])
-    excel_bytes = build_excel(cases)
+def _sse(event_type: str, msg: str, pct: int) -> str:
+    import json
+    return f"data: {json.dumps({'type': event_type, 'msg': msg, 'pct': pct})}\n\n"
+
+
+@app.route("/api/download/<job_id>")
+def download(job_id: str):
+    """Serve the pre-built Excel file for a completed job."""
+    excel_bytes = _results.get(job_id)
+    if not excel_bytes:
+        return {"error": "Job not found or expired"}, 404
     return send_file(
         io.BytesIO(excel_bytes),
         download_name="scotus_cert_cases.xlsx",
