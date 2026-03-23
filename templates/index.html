@@ -95,9 +95,9 @@ td{padding:.6rem .85rem;vertical-align:top}
   </div>
 
   <div class="stats" id="statsRow" style="display:none">
-    <div class="stat"><div class="stat-num" id="s-total">0</div><div class="stat-label">Granted Cases</div></div>
-    <div class="stat"><div class="stat-num" id="s-terms">0</div><div class="stat-label">Terms</div></div>
-    <div class="stat"><div class="stat-num" id="s-oyez">0</div><div class="stat-label">Oyez Matches</div></div>
+    <div class="stat"><div class="stat-num" id="s-total">0</div><div class="stat-label">Total Cases</div></div>
+    <div class="stat"><div class="stat-num" id="s-granted">0</div><div class="stat-label">Granted</div></div>
+    <div class="stat"><div class="stat-num" id="s-denied">0</div><div class="stat-label">Denied</div></div>
     <div class="stat"><div class="stat-num" id="s-showing">0</div><div class="stat-label">Showing (preview)</div></div>
   </div>
 
@@ -122,8 +122,7 @@ td{padding:.6rem .85rem;vertical-align:top}
 </div>
 
 <script>
-let excelB64 = null;
-let allCases = [];
+let currentJobId = null;
 
 function startScrape() {
   const btn = document.getElementById('runBtn');
@@ -136,47 +135,66 @@ function startScrape() {
   document.getElementById('caseTable').style.display = 'none';
   document.getElementById('emptyMsg').style.display = 'block';
   document.getElementById('tbody').innerHTML = '';
+  document.getElementById('statusMsg').style.color = 'var(--muted)';
+  currentJobId = null;
 
   const es = new EventSource('/api/scrape');
+
   es.onmessage = function(e) {
-    const data = JSON.parse(e.data);
+    let data;
+    try { data = JSON.parse(e.data); } catch { return; }
+
     if (data.type === 'progress') {
       document.getElementById('statusMsg').textContent = data.msg;
-      document.getElementById('progressFill').style.width = data.pct + '%';
+      document.getElementById('progressFill').style.width = (data.pct || 0) + '%';
+
     } else if (data.type === 'done') {
       es.close();
+      currentJobId = data.job_id;
       document.getElementById('progressFill').style.width = '100%';
-      document.getElementById('statusMsg').textContent = `Done. ${data.total} cases collected.`;
+      document.getElementById('statusMsg').textContent =
+        `Done. ${data.total.toLocaleString()} cases — ${data.granted} granted, ${data.denied} denied.`;
 
-      allCases = data.preview;
-      excelB64 = data.excel_b64;
-
-      renderTable(data.preview, data.total);
+      renderTable(data.preview, data.total, data.granted, data.denied);
       btn.disabled = false;
       btn.textContent = '↺ Re-scrape';
       document.getElementById('dlBtn').style.display = 'inline-block';
       document.getElementById('done-msg').style.display = 'inline';
-      document.getElementById('done-msg').textContent = `✓ ${data.total} cases ready`;
+      document.getElementById('done-msg').textContent =
+        `✓ ${data.total.toLocaleString()} cases ready`;
+
+    } else if (data.type === 'error') {
+      es.close();
+      document.getElementById('statusMsg').style.color = 'var(--red-t)';
+      document.getElementById('statusMsg').textContent = 'Error: ' + (data.msg || 'Unknown error. Check server logs.');
+      btn.disabled = false;
+      btn.textContent = '↺ Retry';
     }
   };
+
   es.onerror = function() {
-    es.close();
-    document.getElementById('statusMsg').textContent = 'Error during scrape. Check server logs.';
-    btn.disabled = false;
-    btn.textContent = '↺ Retry';
+    // Only treat as error if we haven't already completed
+    if (!currentJobId) {
+      es.close();
+      document.getElementById('statusMsg').style.color = 'var(--red-t)';
+      document.getElementById('statusMsg').textContent =
+        'Connection lost. The scrape may still be running — wait 30s then check if the download button appeared, or retry.';
+      btn.disabled = false;
+      btn.textContent = '↺ Retry';
+    }
   };
 }
 
-function renderTable(cases, total) {
+function renderTable(cases, total, granted, denied) {
   const tbody = document.getElementById('tbody');
   tbody.innerHTML = '';
 
   const terms = new Set(cases.map(c => c.term).filter(Boolean));
   const oyezMatches = cases.filter(c => c.oyez_url).length;
 
-  document.getElementById('s-total').textContent = total;
-  document.getElementById('s-terms').textContent = terms.size;
-  document.getElementById('s-oyez').textContent = oyezMatches;
+  document.getElementById('s-total').textContent = total.toLocaleString();
+  document.getElementById('s-granted').textContent = granted;
+  document.getElementById('s-denied').textContent = denied;
   document.getElementById('s-showing').textContent = cases.length;
   document.getElementById('statsRow').style.display = 'flex';
 
@@ -193,12 +211,15 @@ function renderTable(cases, total) {
     const oyezLink = c.oyez_url
       ? `<a href="${esc(c.oyez_url)}" target="_blank" style="color:var(--accent);font-size:.72rem;">[Oyez]</a>`
       : '';
+    const certBadge = c.granted_cert === 1
+      ? '<span class="badge badge-1">Granted</span>'
+      : '<span class="badge badge-0">Denied</span>';
     tr.innerHTML = `
       <td class="case-name">${esc(c.case_name)} ${oyezLink}</td>
       <td class="mono">${esc(c.docket)}</td>
       <td class="mono">${esc(c.date)}</td>
       <td style="font-size:.78rem;">${esc(c.term)}</td>
-      <td><span class="badge badge-${c.granted_cert}">Granted</span></td>
+      <td>${certBadge}</td>
       <td style="font-size:.78rem;max-width:180px;">${esc(c.outcome)}</td>
       <td style="font-size:.78rem;">${esc(c.decision_direction)}</td>
       <td style="font-size:.78rem;max-width:180px;">${esc(c.issue_area)}</td>
@@ -215,15 +236,8 @@ function esc(s) {
 }
 
 function downloadExcel() {
-  if (!excelB64) return;
-  const bytes = atob(excelB64);
-  const arr = new Uint8Array(bytes.length);
-  for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
-  const blob = new Blob([arr], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = 'scotus_cert_cases.xlsx';
-  a.click();
+  if (!currentJobId) return;
+  window.location.href = '/api/download/' + currentJobId;
 }
 </script>
 </body>
