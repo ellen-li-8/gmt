@@ -470,27 +470,32 @@ def index():
 
 @app.route("/api/scrape")
 def scrape():
-    """SSE endpoint: streams progress messages, stores result server-side."""
+    """
+    SSE endpoint. Runs the scrape in a background thread and streams
+    progress messages + keepalive pings so Railway never drops the connection.
+    """
     import json
+    import threading
+    import queue
 
     job_id = str(uuid.uuid4())
+    q: queue.Queue = queue.Queue()
 
-    def generate():
+    def run_scrape():
         all_cases = []
         total_terms = len(TERM_YEARS)
-
         try:
             for idx, term_year in enumerate(TERM_YEARS):
                 full_year = 2000 + term_year
                 pct = int((idx / total_terms) * 50)
-                yield _sse("progress", f"Fetching order lists for {full_year} term ({idx+1}/{total_terms})...", pct)
+                q.put(_sse("progress", f"Fetching order lists for {full_year} term ({idx+1}/{total_terms})...", pct))
 
                 order_urls = get_order_list_urls(term_year)
                 if not order_urls:
-                    yield _sse("progress", f"No order lists found for {full_year}, skipping.", pct)
+                    q.put(_sse("progress", f"No order lists found for {full_year}, skipping.", pct))
                     continue
 
-                yield _sse("progress", f"Found {len(order_urls)} order lists for {full_year}. Parsing PDFs...", pct)
+                q.put(_sse("progress", f"Found {len(order_urls)} order lists for {full_year}. Parsing PDFs...", pct))
 
                 term_cases = []
                 for pdf_info in order_urls:
@@ -498,7 +503,6 @@ def scrape():
                     term_cases.extend(parsed)
                     time.sleep(0.05)
 
-                # Deduplicate within term by (docket, granted_cert) key
                 seen: set[str] = set()
                 unique = []
                 for c in term_cases:
@@ -510,25 +514,19 @@ def scrape():
                 all_cases.extend(unique)
                 g = sum(1 for c in unique if c["granted_cert"] == 1)
                 d = sum(1 for c in unique if c["granted_cert"] == 0)
-                yield _sse("progress", f"{full_year}: {len(unique)} cases ({g} granted, {d} denied).", pct)
-                time.sleep(0.1)
+                q.put(_sse("progress", f"{full_year}: {len(unique)} cases ({g} granted, {d} denied).", pct))
 
-            yield _sse("progress", f"Enriching {len(all_cases)} cases with Oyez data...", 52)
+            q.put(_sse("progress", f"Enriching {len(all_cases)} cases with Oyez data (this takes a few minutes)...", 52))
             all_cases = enrich_with_oyez(all_cases)
 
-            yield _sse("progress", "Building Excel file...", 92)
+            q.put(_sse("progress", "Building Excel file...", 92))
             excel_bytes = build_excel(all_cases)
 
-            # Store server-side — only send lightweight summary to client
             _results[job_id] = excel_bytes
             _previews[job_id] = all_cases[:300]
             granted_total = sum(1 for c in all_cases if c["granted_cert"] == 1)
             denied_total  = sum(1 for c in all_cases if c["granted_cert"] == 0)
-            _totals[job_id] = {
-                "total": len(all_cases),
-                "granted": granted_total,
-                "denied": denied_total,
-            }
+            _totals[job_id] = {"total": len(all_cases), "granted": granted_total, "denied": denied_total}
 
             payload = json.dumps({
                 "type": "done",
@@ -538,12 +536,28 @@ def scrape():
                 "denied": denied_total,
                 "preview": _previews[job_id],
             })
-            yield f"data: {payload}\n\n"
+            q.put(f"data: {payload}\n\n")
 
         except Exception as e:
             log.exception("Scrape failed")
-            payload = json.dumps({"type": "error", "msg": str(e)})
-            yield f"data: {payload}\n\n"
+            q.put(f"data: {json.dumps({'type': 'error', 'msg': str(e)})}\n\n")
+        finally:
+            q.put(None)  # sentinel — tells generator to stop
+
+    thread = threading.Thread(target=run_scrape, daemon=True)
+    thread.start()
+
+    def generate():
+        KEEPALIVE_INTERVAL = 5   # seconds between pings if queue is idle
+        while True:
+            try:
+                msg = q.get(timeout=KEEPALIVE_INTERVAL)
+                if msg is None:
+                    break
+                yield msg
+            except queue.Empty:
+                # Queue was idle — send a comment ping to keep connection alive
+                yield ": keepalive\n\n"
 
     return Response(generate(), mimetype="text/event-stream",
                     headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
