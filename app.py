@@ -453,12 +453,77 @@ def build_excel(cases: list[dict]) -> bytes:
     return buf.read()
 
 
-# ─── In-memory result store ───────────────────────────────────────────────────
-# Keyed by a job_id so concurrent users don't clobber each other.
-import uuid
-_results: dict[str, bytes] = {}   # job_id -> excel bytes
-_previews: dict[str, list] = {}   # job_id -> first 200 cases (for UI table)
-_totals: dict[str, dict] = {}     # job_id -> {total, granted, denied}
+# ─── In-memory job store ──────────────────────────────────────────────────────
+import uuid, threading
+
+# job_id -> dict with keys: status, msg, pct, error, result_bytes, preview, total, granted, denied
+_jobs: dict[str, dict] = {}
+
+
+def _job_update(job_id: str, **kwargs) -> None:
+    _jobs[job_id].update(kwargs)
+
+
+# ─── Background scrape worker ─────────────────────────────────────────────────
+
+def run_scrape_job(job_id: str) -> None:
+    all_cases = []
+    total_terms = len(TERM_YEARS)
+    try:
+        for idx, term_year in enumerate(TERM_YEARS):
+            full_year = 2000 + term_year
+            pct = int((idx / total_terms) * 50)
+            _job_update(job_id, msg=f"Fetching order lists for {full_year} term ({idx+1}/{total_terms})...", pct=pct)
+
+            order_urls = get_order_list_urls(term_year)
+            if not order_urls:
+                _job_update(job_id, msg=f"No order lists found for {full_year}, skipping.", pct=pct)
+                continue
+
+            _job_update(job_id, msg=f"Found {len(order_urls)} order lists for {full_year}. Parsing PDFs...", pct=pct)
+
+            term_cases = []
+            for pdf_info in order_urls:
+                parsed = parse_order_list_pdf(pdf_info["url"], pdf_info["date"], term_year)
+                term_cases.extend(parsed)
+                time.sleep(0.05)
+
+            seen: set[str] = set()
+            unique = []
+            for c in term_cases:
+                key = f"{c['docket']}_{c['granted_cert']}"
+                if key not in seen:
+                    seen.add(key)
+                    unique.append(c)
+
+            all_cases.extend(unique)
+            g = sum(1 for c in unique if c["granted_cert"] == 1)
+            d = sum(1 for c in unique if c["granted_cert"] == 0)
+            _job_update(job_id, msg=f"{full_year}: {len(unique)} cases ({g} granted, {d} denied).", pct=pct)
+
+        _job_update(job_id, msg=f"Enriching {len(all_cases)} cases with Oyez data (this takes a few minutes)...", pct=52)
+        all_cases = enrich_with_oyez(all_cases)
+
+        _job_update(job_id, msg="Building Excel file...", pct=95)
+        excel_bytes = build_excel(all_cases)
+
+        granted_total = sum(1 for c in all_cases if c["granted_cert"] == 1)
+        denied_total  = sum(1 for c in all_cases if c["granted_cert"] == 0)
+        _job_update(
+            job_id,
+            status="done",
+            msg=f"Done. {len(all_cases):,} cases — {granted_total} granted, {denied_total} denied.",
+            pct=100,
+            result_bytes=excel_bytes,
+            preview=all_cases[:300],
+            total=len(all_cases),
+            granted=granted_total,
+            denied=denied_total,
+        )
+
+    except Exception as e:
+        log.exception("Scrape job failed")
+        _job_update(job_id, status="error", msg=str(e), pct=0)
 
 
 # ─── Flask routes ──────────────────────────────────────────────────────────────
@@ -468,114 +533,41 @@ def index():
     return render_template("index.html")
 
 
-@app.route("/api/scrape")
-def scrape():
-    """
-    SSE endpoint. Runs the scrape in a background thread and streams
-    progress messages + keepalive pings so Railway never drops the connection.
-    """
-    import json
-    import threading
-    import queue
-
+@app.route("/api/start", methods=["POST"])
+def start():
+    """Kick off a background scrape job. Returns job_id immediately."""
     job_id = str(uuid.uuid4())
-    q: queue.Queue = queue.Queue()
-
-    def run_scrape():
-        all_cases = []
-        total_terms = len(TERM_YEARS)
-        try:
-            for idx, term_year in enumerate(TERM_YEARS):
-                full_year = 2000 + term_year
-                pct = int((idx / total_terms) * 50)
-                q.put(_sse("progress", f"Fetching order lists for {full_year} term ({idx+1}/{total_terms})...", pct))
-
-                order_urls = get_order_list_urls(term_year)
-                if not order_urls:
-                    q.put(_sse("progress", f"No order lists found for {full_year}, skipping.", pct))
-                    continue
-
-                q.put(_sse("progress", f"Found {len(order_urls)} order lists for {full_year}. Parsing PDFs...", pct))
-
-                term_cases = []
-                for pdf_info in order_urls:
-                    parsed = parse_order_list_pdf(pdf_info["url"], pdf_info["date"], term_year)
-                    term_cases.extend(parsed)
-                    time.sleep(0.05)
-
-                seen: set[str] = set()
-                unique = []
-                for c in term_cases:
-                    key = f"{c['docket']}_{c['granted_cert']}"
-                    if key not in seen:
-                        seen.add(key)
-                        unique.append(c)
-
-                all_cases.extend(unique)
-                g = sum(1 for c in unique if c["granted_cert"] == 1)
-                d = sum(1 for c in unique if c["granted_cert"] == 0)
-                q.put(_sse("progress", f"{full_year}: {len(unique)} cases ({g} granted, {d} denied).", pct))
-
-            q.put(_sse("progress", f"Enriching {len(all_cases)} cases with Oyez data (this takes a few minutes)...", 52))
-            all_cases = enrich_with_oyez(all_cases)
-
-            q.put(_sse("progress", "Building Excel file...", 92))
-            excel_bytes = build_excel(all_cases)
-
-            _results[job_id] = excel_bytes
-            _previews[job_id] = all_cases[:300]
-            granted_total = sum(1 for c in all_cases if c["granted_cert"] == 1)
-            denied_total  = sum(1 for c in all_cases if c["granted_cert"] == 0)
-            _totals[job_id] = {"total": len(all_cases), "granted": granted_total, "denied": denied_total}
-
-            payload = json.dumps({
-                "type": "done",
-                "job_id": job_id,
-                "total": len(all_cases),
-                "granted": granted_total,
-                "denied": denied_total,
-                "preview": _previews[job_id],
-            })
-            q.put(f"data: {payload}\n\n")
-
-        except Exception as e:
-            log.exception("Scrape failed")
-            q.put(f"data: {json.dumps({'type': 'error', 'msg': str(e)})}\n\n")
-        finally:
-            q.put(None)  # sentinel — tells generator to stop
-
-    thread = threading.Thread(target=run_scrape, daemon=True)
-    thread.start()
-
-    def generate():
-        KEEPALIVE_INTERVAL = 5   # seconds between pings if queue is idle
-        while True:
-            try:
-                msg = q.get(timeout=KEEPALIVE_INTERVAL)
-                if msg is None:
-                    break
-                yield msg
-            except queue.Empty:
-                # Queue was idle — send a comment ping to keep connection alive
-                yield ": keepalive\n\n"
-
-    return Response(generate(), mimetype="text/event-stream",
-                    headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
+    _jobs[job_id] = {"status": "running", "msg": "Starting...", "pct": 0}
+    t = threading.Thread(target=run_scrape_job, args=(job_id,), daemon=True)
+    t.start()
+    return {"job_id": job_id}
 
 
-def _sse(event_type: str, msg: str, pct: int) -> str:
-    import json
-    return f"data: {json.dumps({'type': event_type, 'msg': msg, 'pct': pct})}\n\n"
+@app.route("/api/status/<job_id>")
+def status(job_id: str):
+    """Poll for job progress. Returns JSON — safe short request, no timeout risk."""
+    job = _jobs.get(job_id)
+    if not job:
+        return {"error": "Job not found"}, 404
+    return {
+        "status":  job.get("status", "running"),
+        "msg":     job.get("msg", ""),
+        "pct":     job.get("pct", 0),
+        "total":   job.get("total", 0),
+        "granted": job.get("granted", 0),
+        "denied":  job.get("denied", 0),
+        "preview": job.get("preview", []),
+    }
 
 
 @app.route("/api/download/<job_id>")
 def download(job_id: str):
-    """Serve the pre-built Excel file for a completed job."""
-    excel_bytes = _results.get(job_id)
-    if not excel_bytes:
-        return {"error": "Job not found or expired"}, 404
+    """Serve the finished Excel file."""
+    job = _jobs.get(job_id)
+    if not job or job.get("status") != "done":
+        return {"error": "Job not ready or not found"}, 404
     return send_file(
-        io.BytesIO(excel_bytes),
+        io.BytesIO(job["result_bytes"]),
         download_name="scotus_cert_cases.xlsx",
         as_attachment=True,
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
