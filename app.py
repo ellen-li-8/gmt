@@ -1,6 +1,7 @@
 import os, re, io, time, logging, uuid, threading
-from flask import Flask, render_template, send_file, Response
+from flask import Flask, render_template, send_file
 import requests
+from bs4 import BeautifulSoup
 import pdfplumber
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -19,119 +20,220 @@ HEADERS = {
     )
 }
 
-# 2-digit term years 2011–2025
+# 2-digit SCOTUS term years 2011–2025
 TERM_YEARS = list(range(11, 26))
 
 
-# ─── Step 1: Fetch granted/noted list PDF (1 per term) ────────────────────────
+# ─── SCOTUS: get order list PDF URLs for a term ───────────────────────────────
 
-def fetch_granted_list_pdf(term_year: int) -> str:
-    """
-    Download the Granted/Noted Cases List PDF for a term and return its text.
-    URL: https://www.supremecourt.gov/orders/NNgrantednotedlist.pdf
-    """
-    url = f"https://www.supremecourt.gov/orders/{term_year:02d}grantednotedlist.pdf"
+def get_order_list_urls(term_year: int) -> list[dict]:
+    """Return list of {url, date} for all Order List PDFs in a given term."""
+    url = f"https://www.supremecourt.gov/orders/ordersofthecourt/{term_year:02d}"
     try:
-        r = requests.get(url, headers=HEADERS, timeout=30)
+        r = requests.get(url, headers=HEADERS, timeout=20)
         r.raise_for_status()
     except Exception as e:
-        log.warning(f"Failed to fetch granted list for term {term_year}: {e}")
-        return ""
+        log.warning(f"Failed to fetch order page for term {term_year}: {e}")
+        return []
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    results = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        # Order list PDFs contain "zor.pdf" in the filename
+        if "zor.pdf" in href.lower():
+            full_url = (
+                href if href.startswith("http")
+                else "https://www.supremecourt.gov" + href
+            )
+            # Date is in the surrounding text (e.g. "06/25/12")
+            parent_text = a.parent.get_text(" ") if a.parent else ""
+            date_m = re.search(r"(\d{2}/\d{2}/\d{2,4})", parent_text)
+            date_str = date_m.group(1) if date_m else ""
+            results.append({"url": full_url, "date": date_str})
+    return results
+
+
+# ─── Parse a single order list PDF ───────────────────────────────────────────
+
+def parse_order_list_pdf(pdf_url: str, date_str: str, term_year: int) -> list[dict]:
+    """Download a PDF and return granted-cert cases extracted from it."""
     try:
-        text = ""
+        r = requests.get(pdf_url, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+    except Exception as e:
+        log.warning(f"Failed to fetch PDF {pdf_url}: {e}")
+        return []
+
+    try:
+        full_text = ""
         with pdfplumber.open(io.BytesIO(r.content)) as pdf:
             for page in pdf.pages:
                 t = page.extract_text()
                 if t:
-                    text += t + "\n"
-        return text
+                    full_text += t + "\n"
     except Exception as e:
-        log.warning(f"Failed to parse PDF for term {term_year}: {e}")
-        return ""
+        log.warning(f"Failed to parse PDF {pdf_url}: {e}")
+        return []
+
+    return extract_granted_cases(full_text, date_str, term_year, pdf_url)
 
 
-# ─── Step 2: Parse cases from the granted/noted list PDF ──────────────────────
-
-def parse_granted_list(text: str, term_year: int) -> list[dict]:
+def extract_granted_cases(text: str, date_str: str, term_year: int, source_url: str) -> list[dict]:
     """
-    Parse the Granted/Noted Cases List PDF.
-    Lines look like:
-      11-1234   SMITH v. JONES
+    Parse PDF text and extract only CERTIORARI GRANTED cases.
+
+    Order list PDFs have sections like:
+      CERTIORARI GRANTED
+        11-338 ) DECKER, DOUG, ET AL. V. NORTHWEST ENVTL. DEFENSE CENTER
+        11-347 ) GEORGIA-PACIFIC WEST, ET AL. V. ...
+          The petitions for writs of certiorari are granted...
+        11-460 LOS ANGELES CTY. FLOOD CONTROL V. NATURAL RESOURCES, ET AL.
+          The petition for a writ of certiorari is granted...
+      CERTIORARI DENIED
+        ...  ← stop here
     """
     cases = []
-    full_term = f"October {2000 + term_year}"
+    lines = text.split("\n")
 
-    docket_re = re.compile(r"^\s*(?:No\.\s*)?(\d{1,2}-\d{1,5})\s{2,}(.+)")
-    skip_re = re.compile(
-        r"(GRANTED|NOTED|CASE NAME|DOCKET|^\s*$|October Term|Page \d|"
-        r"Supreme Court|Washington|^\s*\d+\s*$|Continued)",
+    in_granted = False
+
+    # Matches the exact section header "CERTIORARI GRANTED" on its own line
+    granted_header = re.compile(r"^\s*CERTIORARI\s+GRANTED\s*$", re.IGNORECASE)
+
+    # Any of these headers ends the granted section
+    end_section = re.compile(
+        r"^\s*(CERTIORARI\s+DENIED|CERTIORARI\s+\u2014|HABEAS CORPUS|"
+        r"MANDAMUS|REHEARINGS|PROBABLE JURISDICTION|AFFIRMED|REVERSED|"
+        r"DISMISSED|JUDGMENT|ORDERS IN PENDING|APPENDIX|ATTORNEY DISCIPLINE|"
+        r"APPEAL\s+--|CERTIORARI\s+--)",
         re.IGNORECASE
     )
 
-    for line in text.split("\n"):
-        if skip_re.search(line):
+    # Docket number at start of line: "11-1234" or "11-9307", optionally with ")"
+    docket_re = re.compile(r"^\s*(\d{1,2}-\d{1,5})\s*[)]*\s+(.*)")
+
+    full_date = normalize_date(date_str, term_year)
+    full_term = f"October {2000 + term_year}"
+
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+
+        if granted_header.match(stripped):
+            in_granted = True
+            i += 1
             continue
-        m = docket_re.match(line)
-        if m:
-            docket = m.group(1).strip()
-            case_name_raw = m.group(2).strip()
-            # Strip trailing columns (date, etc.)
-            case_name_raw = re.split(r"\s{3,}", case_name_raw)[0]
-            case_name = clean_case_name(case_name_raw)
-            if case_name:
-                cases.append({
-                    "docket": docket,
-                    "case_name": case_name,
-                    "date": "",
-                    "term": full_term,
-                    "granted_cert": 1,
-                    "outcome": "",
-                    "decision_direction": "",
-                    "issue_area": "",
-                    "oyez_url": "",
-                    "circuit_split": 0,
-                    "federalism": 0,
-                    "precedent": 0,
-                    "national_significance": 0,
-                })
+
+        if in_granted and end_section.match(stripped):
+            in_granted = False
+            i += 1
+            continue
+
+        if in_granted:
+            m = docket_re.match(lines[i])
+            if m:
+                docket = m.group(1).strip()
+                case_name_raw = m.group(2).strip()
+
+                # Consume continuation lines that are part of the case name
+                # (e.g. consolidated cases that wrap to next line)
+                j = i + 1
+                while j < len(lines):
+                    ns = lines[j].strip()
+                    if not ns:
+                        break
+                    if docket_re.match(lines[j]):
+                        break
+                    if granted_header.match(ns) or end_section.match(ns):
+                        break
+                    # Prose lines signal the case name is done
+                    if re.match(
+                        r"^(The |It |A |An |This |Petition|Motion|Justice|"
+                        r"Per |Solicitor|See |Whether|Because|Under )",
+                        ns
+                    ):
+                        break
+                    case_name_raw += " " + ns
+                    j += 1
+
+                case_name = clean_case_name(case_name_raw)
+                if case_name:
+                    cases.append({
+                        "docket": docket,
+                        "case_name": case_name,
+                        "date": full_date,
+                        "term": full_term,
+                        "granted_cert": 1,
+                        "outcome": "",
+                        "decision_direction": "",
+                        "issue_area": "",
+                        "oyez_url": "",
+                        "circuit_split": 0,
+                        "federalism": 0,
+                        "precedent": 0,
+                        "national_significance": 0,
+                    })
+                i = j
+                continue
+
+        i += 1
+
     return cases
 
 
 def clean_case_name(raw: str) -> str:
     name = re.sub(r"\s+", " ", raw).strip()
-    name = re.sub(r"\s+\d+$", "", name).strip()
+    # Remove trailing page numbers
+    name = re.sub(r"\s+\d+\s*$", "", name).strip()
+    # Remove closing parens left from consolidated cases
+    name = re.sub(r"\s*\)\s*$", "", name).strip()
+    # Must contain "v." to be a real case name
     if not re.search(r"\bv\.?\s", name, re.IGNORECASE):
         return ""
     return name[:200]
 
 
-# ─── Step 3: Enrich with Oyez (one API call per term, no per-case fetches) ────
+def normalize_date(date_str: str, term_year: int) -> str:
+    if not date_str:
+        return ""
+    m = re.match(r"(\d{1,2})/(\d{1,2})/(\d{2,4})", date_str)
+    if m:
+        mo, day, yr = m.groups()
+        if len(yr) == 2:
+            yr = "20" + yr
+        return f"{yr}-{int(mo):02d}-{int(day):02d}"
+    return date_str
+
+
+# ─── Oyez enrichment (one API call per term, no per-case fetches) ─────────────
 
 def enrich_with_oyez(cases: list[dict]) -> list[dict]:
-    """
-    One Oyez API call per term year to get issue_area, decision_direction,
-    winning_party, decision_date. Much faster than per-case fetching.
-    """
+    """Match cases to Oyez by docket using one term-level API call per year."""
     by_term: dict[int, list] = {}
     for c in cases:
-        yr_match = re.search(r"(\d{4})", c.get("term", ""))
-        if yr_match:
-            by_term.setdefault(int(yr_match.group(1)), []).append(c)
+        yr_m = re.search(r"(\d{4})", c.get("term", ""))
+        if yr_m:
+            by_term.setdefault(int(yr_m.group(1)), []).append(c)
 
     for year, term_cases in sorted(by_term.items()):
         log.info(f"Fetching Oyez data for {year}...")
         oyez_list = fetch_oyez_term(year)
 
+        # Build docket lookup with a few key variants
         lookup: dict[str, dict] = {}
         for oc in oyez_list:
             d = (oc.get("docket_number") or "").strip()
             if d:
                 lookup[d] = oc
+                # Strip leading zeros after dash: "14-0000" -> "14-0"
                 lookup[re.sub(r"-0+(\d)", r"-\1", d)] = oc
 
         for c in term_cases:
-            oc = lookup.get(c["docket"]) or lookup.get(
-                re.sub(r"-0+(\d)", r"-\1", c["docket"])
+            raw_docket = c["docket"]
+            oc = (
+                lookup.get(raw_docket)
+                or lookup.get(re.sub(r"-0+(\d)", r"-\1", raw_docket))
             )
             if not oc:
                 continue
@@ -146,14 +248,16 @@ def enrich_with_oyez(cases: list[dict]) -> list[dict]:
                 c["decision_direction"] = d0.get("decision_direction") or ""
                 c["outcome"] = d0.get("winning_party") or ""
 
-            dd = oc.get("decision_date")
-            if dd and not c["date"]:
-                try:
-                    from datetime import datetime, timezone
-                    dt = datetime.fromtimestamp(int(dd), tz=timezone.utc)
-                    c["date"] = dt.strftime("%Y-%m-%d")
-                except Exception:
-                    pass
+            # Use Oyez decision date if we didn't get one from the PDF
+            if not c["date"]:
+                dd = oc.get("decision_date")
+                if dd:
+                    try:
+                        from datetime import datetime, timezone
+                        dt = datetime.fromtimestamp(int(dd), tz=timezone.utc)
+                        c["date"] = dt.strftime("%Y-%m-%d")
+                    except Exception:
+                        pass
 
         time.sleep(0.3)
 
@@ -171,7 +275,7 @@ def fetch_oyez_term(year: int) -> list[dict]:
         return []
 
 
-# ─── Step 4: Build Excel ──────────────────────────────────────────────────────
+# ─── Build Excel ──────────────────────────────────────────────────────────────
 
 def build_excel(cases: list[dict]) -> bytes:
     wb = openpyxl.Workbook()
@@ -193,8 +297,8 @@ def build_excel(cases: list[dict]) -> bytes:
     thin = Side(style="thin", color="444444")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    for col_idx, header in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col_idx, value=header)
+    for col_idx, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col_idx, value=h)
         cell.fill = header_fill
         cell.font = header_font
         cell.alignment = header_align
@@ -229,7 +333,9 @@ def build_excel(cases: list[dict]) -> bytes:
             cell.border = border
             if fill:
                 cell.fill = fill
-            cell.alignment = left_align if col_idx in (1, 6, 7, 8, 13) else center_align
+            cell.alignment = (
+                left_align if col_idx in (1, 6, 7, 8, 13) else center_align
+            )
 
     col_widths = [45, 12, 14, 18, 16, 28, 22, 24, 14, 20, 18, 22, 40]
     for i, w in enumerate(col_widths, 1):
@@ -238,20 +344,23 @@ def build_excel(cases: list[dict]) -> bytes:
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
 
+    # Summary sheet
     ws2 = wb.create_sheet("Summary")
     ws2["A1"] = "SCOTUS Certiorari Dataset — Summary"
     ws2["A1"].font = Font(bold=True, size=14, name="Calibri")
     terms = sorted(set(c.get("term", "") for c in cases))
     from datetime import datetime
-    for i, (label, val) in enumerate([
-        ("Total cases (granted cert):", len(cases)),
+    rows = [
+        ("Total cases (cert granted):", len(cases)),
         ("Terms covered:", ", ".join(terms)),
         ("Generated:", datetime.now().strftime("%Y-%m-%d %H:%M UTC")),
-    ], 3):
-        ws2.cell(row=i, column=1, value=label).font = Font(name="Calibri", size=10)
+        ("Note:", "Circuit Split / Federalism / Precedent / National Significance columns require manual review."),
+    ]
+    for i, (label, val) in enumerate(rows, 3):
+        ws2.cell(row=i, column=1, value=label).font = Font(name="Calibri", size=10, bold=True)
         ws2.cell(row=i, column=2, value=val).font = Font(name="Calibri", size=10)
-    ws2.column_dimensions["A"].width = 30
-    ws2.column_dimensions["B"].width = 60
+    ws2.column_dimensions["A"].width = 32
+    ws2.column_dimensions["B"].width = 80
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -259,7 +368,7 @@ def build_excel(cases: list[dict]) -> bytes:
     return buf.read()
 
 
-# ─── Job store + background worker ───────────────────────────────────────────
+# ─── Background job store ─────────────────────────────────────────────────────
 
 _jobs: dict[str, dict] = {}
 
@@ -275,26 +384,36 @@ def run_scrape_job(job_id: str):
             full_year = 2000 + term_year
             pct = int((idx / len(TERM_YEARS)) * 70)
             _upd(job_id,
-                 msg=f"Fetching granted list for {full_year} ({idx+1}/{len(TERM_YEARS)})...",
+                 msg=f"Fetching order lists for {full_year} ({idx+1}/{len(TERM_YEARS)})...",
                  pct=pct)
 
-            text = fetch_granted_list_pdf(term_year)
-            if not text:
-                _upd(job_id, msg=f"No data for {full_year}, skipping.", pct=pct)
+            order_urls = get_order_list_urls(term_year)
+            if not order_urls:
+                _upd(job_id, msg=f"No order lists found for {full_year}, skipping.", pct=pct)
                 continue
 
-            cases = parse_granted_list(text, term_year)
+            _upd(job_id,
+                 msg=f"{full_year}: found {len(order_urls)} order lists, parsing PDFs...",
+                 pct=pct)
 
+            term_cases = []
+            for pdf_info in order_urls:
+                parsed = parse_order_list_pdf(pdf_info["url"], pdf_info["date"], term_year)
+                term_cases.extend(parsed)
+                time.sleep(0.05)
+
+            # Deduplicate by docket number within each term
             seen: set[str] = set()
             unique = []
-            for c in cases:
+            for c in term_cases:
                 if c["docket"] not in seen:
                     seen.add(c["docket"])
                     unique.append(c)
 
             all_cases.extend(unique)
-            _upd(job_id, msg=f"{full_year}: {len(unique)} cases found.", pct=pct)
-            time.sleep(0.1)
+            _upd(job_id,
+                 msg=f"{full_year}: {len(unique)} granted-cert cases found.",
+                 pct=pct)
 
         _upd(job_id, msg=f"Enriching {len(all_cases)} cases with Oyez data...", pct=72)
         all_cases = enrich_with_oyez(all_cases)
@@ -304,7 +423,7 @@ def run_scrape_job(job_id: str):
 
         _upd(job_id,
              status="done",
-             msg=f"Done. {len(all_cases):,} granted cases across {len(TERM_YEARS)} terms.",
+             msg=f"Done — {len(all_cases):,} granted cases across {len(TERM_YEARS)} terms.",
              pct=100,
              result_bytes=excel_bytes,
              preview=all_cases[:300],
